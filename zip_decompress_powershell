@@ -1,0 +1,109 @@
+# --- Settings ---
+$WatchPath        = 'C:\Path\To\Watch'
+$ExtractRoot      = 'C:\Path\To\Extract'
+$ProcessedZipPath = 'C:\Path\To\Processed'   # optional; set $null to skip
+$LogPath          = 'C:\Path\To\Logs\autoextract.log'
+
+# Ensure folders exist
+$null = New-Item -ItemType Directory -Path $WatchPath      -Force -ErrorAction SilentlyContinue
+$null = New-Item -ItemType Directory -Path $ExtractRoot    -Force -ErrorAction SilentlyContinue
+if ($ProcessedZipPath) { $null = New-Item -ItemType Directory -Path $ProcessedZipPath -Force -ErrorAction SilentlyContinue }
+$null = New-Item -ItemType Directory -Path (Split-Path $LogPath) -Force -ErrorAction SilentlyContinue
+
+# Helper: simple logger
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "$timestamp [$Level] $Message" | Out-File -FilePath $LogPath -Append -Encoding utf8
+}
+
+# Helper: wait until file is stable (size not changing) and can be opened
+function Wait-FileReady {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [int]$StableSeconds = 3,
+        [int]$TimeoutSeconds = 300
+    )
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $lastSize = -1
+    $stableFor = 0
+
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        if (-not (Test-Path $Path)) {
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        try {
+            # Try opening the file exclusively; if it fails, it's in use
+            $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'None')
+            $size = (Get-Item $Path).Length
+            $fs.Close()
+
+            if ($size -eq $lastSize -and $size -gt 0) {
+                $stableFor++
+                if ($stableFor -ge $StableSeconds) { return $true }
+            } else {
+                $stableFor = 0
+                $lastSize = $size
+            }
+            Start-Sleep -Seconds 1
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    return $false
+}
+
+# Create the watcher
+$watcher = New-Object System.IO.FileSystemWatcher
+$watcher.Path = $WatchPath
+$watcher.Filter = '*.zip'
+$watcher.IncludeSubdirectories = $false
+$watcher.NotifyFilter = [IO.NotifyFilters]'FileName, LastWrite, Size'
+$watcher.EnableRaisingEvents = $true
+
+Write-Log "Watching '$WatchPath' for new ZIP files."
+
+# Event action
+$createdHandler = Register-ObjectEvent -InputObject $watcher -EventName Created -Action {
+    $zipFile = $Event.SourceEventArgs.FullPath
+    $nameOnly = [IO.Path]::GetFileNameWithoutExtension($zipFile)
+    $destination = Join-Path $using:ExtractRoot $nameOnly
+
+    try {
+        # Wait until file is stable and ready
+        if (-not (Wait-FileReady -Path $zipFile -StableSeconds 3 -TimeoutSeconds 600)) {
+            Write-Log "Timeout waiting for file to be ready: $zipFile" 'WARN'
+            return
+        }
+
+        # Ensure destination subfolder exists
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+        Write-Log "Extracting '$zipFile' to '$destination'..."
+        Expand-Archive -Path $zipFile -DestinationPath $destination -Force
+        Write-Log "Extraction completed: $zipFile"
+
+        # Optionally move processed ZIP
+        if ($using:ProcessedZipPath) {
+            $target = Join-Path $using:ProcessedZipPath ([IO.Path]::GetFileName($zipFile))
+            Move-Item -LiteralPath $zipFile -Destination $target -Force
+            Write-Log "Moved processed ZIP to: $target"
+        }
+
+    } catch {
+        Write-Log "Error processing '$zipFile': $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+# Keep the script alive. Press Ctrl+C in console, or stop the scheduled task to end it.
+try {
+    while ($true) { Wait-Event -Timeout 5 | Out-Null }
+} finally {
+    # Cleanup event subscription if exiting
+    if ($createdHandler) { Unregister-Event -SourceIdentifier $createdHandler.Name -ErrorAction SilentlyContinue }
+    if ($watcher)       { $watcher.EnableRaisingEvents = $false; $watcher.Dispose() }
+    Write-Log "Watcher stopped."
+}
+``
